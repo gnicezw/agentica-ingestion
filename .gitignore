@@ -1,0 +1,68 @@
+# =========================================================
+# Agentica (Phase 1 Ingestion) — Git Ignore
+# Keep: code, config/, urls_pending.csv, requirements.txt
+# Ignore: environments, generated artifacts, logs, caches, secrets
+# =========================================================
+
+# -----------------------------
+# Python virtual environments
+# -----------------------------
+.venv/
+venv/
+
+# -----------------------------
+# Python bytecode / cache
+# -----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# -----------------------------
+# Packaging / build artifacts
+# (harmless to ignore; prevents clutter if you ever package this)
+# -----------------------------
+*.egg-info/
+dist/
+build/
+
+# -----------------------------
+# Environment variables / secrets
+# (hairy: ignoring .env is good, but don't store secrets in repo anyway)
+# -----------------------------
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets*.json
+
+# -----------------------------
+# Jupyter (only if you use notebooks)
+# -----------------------------
+.ipynb_checkpoints/
+
+# -----------------------------
+# Editor / OS junk
+# -----------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# -----------------------------
+# Logs and temp caches
+# (Note: your repo uses logs/ plus *.log sometimes)
+# -----------------------------
+logs/
+*.log
+tmp/
+.cache/
+
+# -----------------------------
+# Agentica generated ingestion data
+# These grow quickly and are reproducible from urls_pending.csv + code + config.
+# -----------------------------
+sources_raw/
+processed/
+

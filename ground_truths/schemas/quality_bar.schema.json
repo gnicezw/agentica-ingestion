@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "quality_bar.schema.json",
+  "title": "QualityBar",
+  "type": "object",
+  "required": ["answer_length_max", "require_citation", "reading_level"],
+  "properties": {
+    "answer_length_max": { "type": "integer", "minimum": 1 },
+    "require_citation": { "type": "boolean" },
+    "reading_level": { "type": "string", "enum": ["MS", "HS", "Undergrad"] },
+    "fallback_policy": { "type": "string", "enum": ["extractive_if_no_citation","always_generate"] },
+    "unknown_policy": { "type": "string", "enum": ["say_i_dont_know","omit"] },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "target_latency_ms": { "type": "integer", "minimum": 100 },
+        "priority": { "type": "string", "enum": ["speed","depth","balanced"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
+

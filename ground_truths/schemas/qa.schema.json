@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qa.schema.json",
+  "title": "GroundTruthQA",
+  "type": "object",
+  "required": ["qa_id", "question", "answer", "citations"],
+  "properties": {
+    "qa_id": { "type": "string" },
+    "question": { "type": "string" },
+    "answer": { "type": "string", "description": "3–7 sentences in student’s own words" },
+    "citations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["doc_id"],
+        "properties": {
+          "doc_id": { "type": "string" },
+          "chunk_id": { "type": ["string", "null"] },
+          "page_number": { "type": ["integer", "null"] },
+          "note": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    },
+    "tags": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}
+

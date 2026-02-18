@@ -1,0 +1,316 @@
+#!/usr/bin/env python
+"""
+Agentica — Phase 1: Corpus Ingestion and Normalization
+------------------------------------------------------
+
+Purpose:
+--------
+Fetch web documents, normalize text, and serialize into standard JSONL outputs
+for downstream RAG phases (chunking, embeddings, vectorization, retrieval).
+
+Inputs:
+-------
+  • Single URL (--url)
+  • Or a list of URLs from a file (--urls-file)
+
+Outputs:
+--------
+  • sources_raw/<host>/<slug>.html — raw HTML
+  • sources_raw/<host>/<slug>.txt  — normalized plain text
+  • processed/documents.jsonl      — metadata + per-document record
+  • processed/chunks.jsonl         — segmented text chunks
+
+Workflow:
+---------
+  1. Fetch target URL (requests) → save raw HTML.
+  2. Extract and clean text (LangChain WebBaseLoader).
+  3. Normalize whitespace, infer title, compute hashes/tokens.
+  4. Serialize document metadata to `documents.jsonl`.
+  5. Chunk text per config/chunking.json → `chunks.jsonl`.
+  6. Log all ingestion events to `logs/ingest.log`.
+
+CLI Usage:
+----------
+    python agentica_phase1.py \
+        --url "https://www.symmetrymagazine.org/article/the-problem-solver-cosmic-inflation"
+
+Automation Note:
+----------------
+This module can be invoked manually, from a Makefile, or via a supervisor
+(e.g., cron / Airflow / Celery) to continuously build the Agentica corpus.
+It assumes Phase 2 (vectorization) will read from `processed/`.
+"""
+
+#!/usr/bin/env python
+# ---------------------------------------------------------
+# Agentica Phase 1 — URL Ingestion and Text Normalization
+# ---------------------------------------------------------
+# This script automates fetching and cleaning web articles,
+# outputting structured JSONL files ready for embeddings.
+# ---------------------------------------------------------
+
+import sys, os
+
+# --- Safety check: ensure virtual environment is active ---
+if not sys.prefix.endswith(".venv"):
+    print("⚠️ Not running inside .venv — activate it with `source .venv/bin/activate`")
+
+# --- Standard Library Imports ---
+import argparse, json, re, hashlib, os, time, datetime as dt, pathlib
+from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
+from slugify import slugify
+from tqdm import tqdm
+
+# --- LangChain Tools ---
+from langchain_community.document_loaders import WebBaseLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+# ---------------------------------------------------------------------
+# TAXONOMY VALIDATION (Hybrid metadata system)
+# ---------------------------------------------------------------------
+import json
+
+def load_taxonomy(config_path="config/taxonomy.json"):
+    """Load and return allowed levels and eras."""
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+TAXONOMY = load_taxonomy()
+
+def validate_tags(level, era):
+    """Ensure provided level and era exist in taxonomy; raise if invalid."""
+    if level not in TAXONOMY["levels"]:
+        raise ValueError(f"Invalid level '{level}'. Allowed: {TAXONOMY['levels']}")
+    if era not in TAXONOMY["eras"]:
+        raise ValueError(f"Invalid era '{era}'. Allowed: {TAXONOMY['eras']}")
+
+# =========================================================
+# Helper Functions
+# =========================================================
+
+def count_tokens(text: str) -> int:
+    """Count approximate tokens using tiktoken (fallback heuristic)."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        # Heuristic: ~4 chars per token if tokenizer not available
+        return max(1, len(text) // 4)
+
+def now_iso():
+    """Return current UTC time in ISO 8601 with Z suffix."""
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def safe_host_dir(url: str) -> str:
+    """Extract domain and normalize as folder name."""
+    return urlparse(url).netloc.replace("www.", "")
+
+def fetch_raw_html(url: str, timeout=30) -> str:
+    """Download raw HTML manually (separate from LangChain)."""
+    resp = requests.get(
+        url, timeout=timeout,
+        headers={"User-Agent": "Agentica/Phase1 (edu; RAG bootstrap)"}
+    )
+    resp.raise_for_status()
+    return resp.text
+
+def clean_text(text: str) -> str:
+    """Normalize whitespace, collapse multiple blank lines."""
+    text = text.replace("\r", "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def extract_title_fallback(html: str) -> str:
+    """Fallback title extraction via <title> or <h1>."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        if soup.title and soup.title.get_text(strip=True):
+            return soup.title.get_text(strip=True)
+        h1 = soup.find("h1")
+        if h1:
+            return h1.get_text(strip=True)
+    except Exception:
+        pass
+    return ""
+
+def sha256(s: str) -> str:
+    """Hash helper for deduplication and document IDs."""
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def load_chunking_config(path="config/chunking.json"):
+    """Load chunking settings or fallback to defaults."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"chunk_size": 1000, "chunk_overlap": 200}
+
+def make_text_splitter(cfg):
+    """Configure LangChain’s recursive splitter."""
+    separators = ["\n\n", "\n", " ", ""]
+    return RecursiveCharacterTextSplitter(
+        chunk_size=cfg.get("chunk_size", 1000),
+        chunk_overlap=cfg.get("chunk_overlap", 200),
+        separators=separators
+    )
+
+def ensure_dir(p: str):
+    """Ensure directory exists (mkdir -p behavior)."""
+    pathlib.Path(p).mkdir(parents=True, exist_ok=True)
+
+def _looks_like_schema(path: str) -> bool:
+    """Detect accidental writes into schema files."""
+    if not os.path.exists(path):
+        return False
+    with open(path, "r", encoding="utf-8") as f:
+        head = f.read(1024)
+    return '"$schema"' in head and '"$id"' in head
+
+def safe_write_jsonl(path: str, rows: list):
+    """Safely append rows to JSONL file (skipping schema files)."""
+    if _looks_like_schema(path):
+        raise RuntimeError(
+            f"{path} looks like a JSON Schema file. "
+            "Move it under processed/schemas/*.json and rerun."
+        )
+    mode = "a" if os.path.exists(path) else "w"
+    with open(path, mode, encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+# =========================================================
+# Core Function: Process a Single URL
+# =========================================================
+
+def process_url(url: str, level="HS", era="Cosmic Inflation"):
+    """Fetch, clean, and chunk a single web document."""
+    host = safe_host_dir(url)
+    raw_dir = os.path.join("sources_raw", host)
+    ensure_dir(raw_dir)
+    processed_dir = "processed"
+    ensure_dir(processed_dir)
+
+    fetched_at = now_iso()
+
+    # (1) Fetch raw HTML
+    html = fetch_raw_html(url)
+    parsed = urlparse(url)
+    candidate = parsed.path.strip("/").split("/")[-1] or parsed.netloc
+    base = slugify(candidate) or "index"
+
+    raw_html_path = os.path.join(raw_dir, f"{base}.html")
+    with open(raw_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    # (2) Extract text using LangChain loader
+    loader = WebBaseLoader([url])
+    docs = loader.load()
+
+    if not docs:
+        # Fallback: direct BeautifulSoup extraction
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True)
+        docs = [{"page_content": text, "metadata": {"source": url}}]
+
+    # (3) Normalize text and infer title
+    page_text = docs[0].page_content if hasattr(docs[0], "page_content") else docs[0]["page_content"]
+    page_text = clean_text(page_text)
+    md = docs[0].metadata if hasattr(docs[0], "metadata") else docs[0]["metadata"]
+    title = md.get("title") or extract_title_fallback(html) or base.replace("-", " ").title()
+
+    # Save plain text
+    raw_txt_path = os.path.join(raw_dir, f"{base}.txt")
+    with open(raw_txt_path, "w", encoding="utf-8") as f:
+        f.write(page_text)
+
+    # (4) Create document record
+    doc_id = sha256(url)[:16]
+    doc_row = {
+        "id": doc_id,
+        "source_url": url,
+        "title": title,
+        "language": "en",
+        "fetched_at": fetched_at,
+        "hash_sha256": sha256(page_text),
+        "text_char_len": len(page_text),
+        "text_token_len": count_tokens(page_text),
+        "raw_html_path": raw_html_path,
+        "raw_txt_path": raw_txt_path,
+        "origin": "web",
+        "publisher": host,
+    }
+    # -----------------------------------------------------------------
+    # HYBRID METADATA ADDITION
+    # -----------------------------------------------------------------
+    validate_tags(level, era)
+    doc_row["metadata"] = {"level": level, "era": era}
+
+    safe_write_jsonl(os.path.join(processed_dir, "documents.jsonl"), [doc_row])
+
+    # (5) Chunk into passages
+    cfg = load_chunking_config()
+    splitter = make_text_splitter(cfg)
+    chunks = splitter.split_text(page_text)
+
+    chunk_rows = [
+        {
+            "doc_id": doc_id,
+            "chunk_id": f"{doc_id}-{i:04d}",
+            "chunk_index": i,
+            "content": chunk,
+            "content_char_len": len(chunk),
+            "content_token_len": count_tokens(chunk),
+            "metadata": {"level": level, "era": era},  # 👈 added line
+        }
+        for i, chunk in enumerate(chunks)
+    ]
+    safe_write_jsonl(os.path.join(processed_dir, "chunks.jsonl"), chunk_rows)
+
+    # (6) Log success
+    ensure_dir("logs")
+    with open(os.path.join("logs", "ingest.log"), "a", encoding="utf-8") as f:
+        f.write(f"[{fetched_at}] OK {url} -> doc_id={doc_id}, chunks={len(chunk_rows)}\n")
+
+    return {"doc_id": doc_id, "title": title, "chunks": len(chunk_rows), "raw_txt_path": raw_txt_path}
+
+# =========================================================
+# CLI Entrypoint
+# =========================================================
+
+def main():
+    """CLI interface — supports --url or --urls-file."""
+    ap = argparse.ArgumentParser(description="Agentica Phase 1: URL ingestion")
+    ap.add_argument("--url", action="append", help="URL(s) to ingest", default=[])
+    ap.add_argument("--urls-file", help="File containing URLs (one per line)")
+    args = ap.parse_args()
+
+    # Collect URLs
+    urls = []
+    if args.url:
+        urls.extend(args.url)
+    if args.urls_file and os.path.exists(args.urls_file):
+        with open(args.urls_file, "r", encoding="utf-8") as f:
+            urls += [u.strip() for u in f if u.strip() and not u.startswith("#")]
+
+    if not urls:
+        print("No URLs supplied. Use --url or --urls-file.")
+        return
+
+    print(f"Ingesting {len(urls)} URL(s)...")
+    for u in tqdm(urls):
+        try:
+            info = process_url(u)
+            tqdm.write(f"✔ {info['title']} ({info['chunks']} chunks) -> {info['raw_txt_path']}")
+        except Exception as e:
+            ts = now_iso()
+            ensure_dir("logs")
+            with open(os.path.join("logs", "ingest.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] ERROR {u} -> {repr(e)}\n")
+            tqdm.write(f"✖ ERROR {u}: {e}")
+
+if __name__ == "__main__":
+    main()
+

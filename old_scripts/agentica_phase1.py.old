@@ -1,0 +1,246 @@
+#!/usr/bin/env python
+"""
+Phase 1: Fetch a URL with LangChain WebBaseLoader, normalize text, and export
+- raw HTML + raw TXT under sources_raw/<host>/
+- processed/documents.jsonl (one doc per URL)
+- processed/chunks.jsonl    (one row per chunk)
+
+Run:
+  python agentica_phase1.py \
+    --url "https://www.symmetrymagazine.org/article/the-problem-solver-cosmic-inflation?language_content_entity=und&utm_source=chatgpt.com"
+"""
+#make sure the program is running in venv
+import sys, os
+if not sys.prefix.endswith(".venv"):
+    print("⚠️ Not running inside .venv — activate it with `source .venv/bin/activate`")
+
+
+
+# --- imports ---
+import argparse, json, re, hashlib, os, time, datetime as dt, pathlib
+from urllib.parse import urlparse
+import requests
+from bs4 import BeautifulSoup
+from slugify import slugify
+from tqdm import tqdm
+import sys, os
+
+
+# LangChain imports
+from langchain_community.document_loaders import WebBaseLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+
+# --- helpers ---
+
+def count_tokens(text: str) -> int:
+    """Count tokens with tiktoken (fallback: chars/4 heuristic)."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        return max(1, len(text) // 4)
+
+def now_iso():
+    """UTC ISO timestamp with Z suffix (for logs/metadata)."""
+    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def safe_host_dir(url: str) -> str:
+    """Turn URL host into a safe folder name."""
+    return urlparse(url).netloc.replace("www.", "")
+
+def fetch_raw_html(url: str, timeout=30) -> str:
+    """Grab raw HTML with requests (kept separate from LangChain)."""
+    resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Agentica/Phase1 (edu; RAG bootstrap)"})
+    resp.raise_for_status()
+    return resp.text
+
+def clean_text(text: str) -> str:
+    """Normalize whitespace and remove excess blank lines."""
+    text = text.replace("\r", "")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def extract_title_fallback(html: str) -> str:
+    """Fallback: use <title> or first <h1> if loader metadata has no title."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        if soup.title and soup.title.get_text(strip=True):
+            return soup.title.get_text(strip=True)
+        h1 = soup.find("h1")
+        if h1:
+            return h1.get_text(strip=True)
+    except Exception:
+        pass
+    return ""
+
+def sha256(s: str) -> str:
+    """Quick sha256 hash helper (for doc_id and dedupe)."""
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def load_chunking_config(path="config/chunking.json"):
+    """Read config/chunking.json if it exists, else defaults."""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"chunk_size": 1000, "chunk_overlap": 200}
+
+def make_text_splitter(cfg):
+    """Create a LangChain splitter with paragraph → line → space → char fallback."""
+    separators = ["\n\n", "\n", " ", ""]
+    return RecursiveCharacterTextSplitter(
+        chunk_size=cfg.get("chunk_size", 1000),
+        chunk_overlap=cfg.get("chunk_overlap", 200),
+        separators=separators
+    )
+
+def ensure_dir(p: str):
+    """Create a folder if missing (like mkdir -p)."""
+    pathlib.Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def _looks_like_schema(path: str) -> bool:
+    if not os.path.exists(path): 
+        return False
+    with open(path, "r", encoding="utf-8") as f:
+        head = f.read(1024)
+    return '"$schema"' in head and '"$id"' in head
+
+def safe_write_jsonl(path: str, rows: list):
+    if _looks_like_schema(path):
+        raise RuntimeError(
+            f"{path} looks like a JSON Schema file. "
+            "Move it under processed/schemas/*.json and rerun."
+        )
+    mode = "a" if os.path.exists(path) else "w"
+    with open(path, mode, encoding="utf-8") as f:
+        for r in rows:
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+
+# --- main processing for one URL ---
+
+def process_url(url: str):
+    # derive paths
+    host = safe_host_dir(url)
+    raw_dir = os.path.join("sources_raw", host)
+    ensure_dir(raw_dir)
+    processed_dir = "processed"
+    ensure_dir(processed_dir)
+
+    fetched_at = now_iso()
+
+    # 1) fetch and save raw HTML
+    html = fetch_raw_html(url)
+    parsed = urlparse(url)
+    candidate = parsed.path.strip("/").split("/")[-1] or parsed.netloc
+    base = slugify(candidate) or "index"
+    raw_html_path = os.path.join(raw_dir, f"{base}.html")
+    with open(raw_html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+    # 2) extract text with LangChain WebBaseLoader
+    loader = WebBaseLoader([url])
+    docs = loader.load()
+
+    if not docs:
+        # fallback: plain soup text
+        soup = BeautifulSoup(html, "lxml")
+        text = soup.get_text("\n", strip=True)
+        docs = [{
+            "page_content": text,
+            "metadata": {"source": url}
+        }]
+
+    # 3) normalize text and pick title
+    page_text = docs[0].page_content if hasattr(docs[0], "page_content") else docs[0]["page_content"]
+    page_text = clean_text(page_text)
+    md = docs[0].metadata if hasattr(docs[0], "metadata") else docs[0]["metadata"]
+    title = md.get("title") or extract_title_fallback(html) or base.replace("-", " ").title()
+
+    # save raw txt
+    raw_txt_path = os.path.join(raw_dir, f"{base}.txt")
+    with open(raw_txt_path, "w", encoding="utf-8") as f:
+        f.write(page_text)
+
+    # 4) build documents.jsonl row
+    doc_id = sha256(url)[:16]
+    doc_row = {
+        "id": doc_id,
+        "source_url": url,
+        "title": title,
+        "language": "en",
+        "fetched_at": fetched_at,
+        "hash_sha256": sha256(page_text),
+        "text_char_len": len(page_text),
+        "text_token_len": count_tokens(page_text),
+        "raw_html_path": raw_html_path,
+        "raw_txt_path": raw_txt_path,
+        "origin": "web",
+        "publisher": host
+    }
+    safe_write_jsonl(os.path.join(processed_dir, "documents.jsonl"), [doc_row])
+
+    # 5) chunk into passages and save to chunks.jsonl
+    cfg = load_chunking_config()
+    splitter = make_text_splitter(cfg)
+    chunks = splitter.split_text(page_text)
+
+    chunk_rows = []
+    for i, chunk in enumerate(chunks):
+        chunk_rows.append({
+            "doc_id": doc_id,
+            "chunk_id": f"{doc_id}-{i:04d}",
+            "chunk_index": i,
+            "content": chunk,
+            "content_char_len": len(chunk),
+            "content_token_len": count_tokens(chunk)
+        })
+    safe_write_jsonl(os.path.join(processed_dir, "chunks.jsonl"), chunk_rows)
+
+    # 6) log status
+    with open(os.path.join("logs", "ingest.log"), "a", encoding="utf-8") as f:
+        f.write(f"[{fetched_at}] OK {url} -> doc_id={doc_id}, chunks={len(chunk_rows)}\n")
+
+    return {"doc_id": doc_id, "title": title, "chunks": len(chunk_rows), "raw_txt_path": raw_txt_path}
+
+
+# --- CLI entrypoint ---
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--url", action="append", help="URL to ingest", default=[])
+    ap.add_argument("--urls-file", help="File with one URL per line")
+    args = ap.parse_args()
+
+    urls = []
+    if args.url:
+        urls.extend(args.url)
+    if args.urls_file and os.path.exists(args.urls_file):
+        with open(args.urls_file, "r", encoding="utf-8") as f:
+            for line in f:
+                u = line.strip()
+                if u and not u.startswith("#"):
+                    urls.append(u)
+
+    if not urls:
+        print("No URLs supplied. Use --url or --urls-file.")
+        return
+
+    print(f"Ingesting {len(urls)} URL(s)...")
+    for u in tqdm(urls):
+        try:
+            info = process_url(u)
+            tqdm.write(f"✔ {info['title']} ({info['chunks']} chunks) -> {info['raw_txt_path']}")
+        except Exception as e:
+            ts = now_iso()
+            with open(os.path.join("logs", "ingest.log"), "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] ERROR {u} -> {repr(e)}\n")
+            tqdm.write(f"✖ ERROR {u}: {e}")
+
+if __name__ == "__main__":
+    main()
+

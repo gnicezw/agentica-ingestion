@@ -1,0 +1,12 @@
+{
+  "levels": ["MS", "HS"],
+  "eras": [
+    "Big Bang & Planck Era",
+    "Cosmic Inflation",
+    "Quark-Gluon Plasma / Particle Era",
+    "Nucleosynthesis",
+    "Photon Era & Recombination",
+    "Dark Ages",
+    "Reionization / First Stars"
+  ]
+}
